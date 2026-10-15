@@ -14,17 +14,24 @@ so we keep it once on the finding and keep only the genuinely per-resource field
 
 Output is a single self-contained HTML file: no server, no dependencies, no network.
 
+Findings can be triaged in the report itself: ticked complete, switched to false positive
+(individually or per affected resource) and annotated. Those marks auto-save to browser
+storage and can be exported as JSON; point --state at that file when regenerating and your
+triage carries over to the new scan.
+
 Usage:
     python prowler_view.py ./output/                    # whole directory
     python prowler_view.py scan.csv -o report.html      # one file
     python prowler_view.py ./output/ --include-pass     # keep PASS results too
     python prowler_view.py scan.csv --doctor            # inspect schema, print no findings
+    python prowler_view.py ./output/ --state triage.json  # resume saved triage
 
 Standard library only. Tested against Prowler 5.42.0 CSV output (raw CLI and dashboard).
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -32,7 +39,12 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+
+# Name of the triage state file looked for beside the output HTML unless --state says
+# otherwise. Holds your complete / false-positive / notes marks, keyed by check id, so it
+# survives regenerating the report from a newer scan.
+DEFAULT_STATE_NAME = "prowler-view-state.json"
 
 # --------------------------------------------------------------------------------------
 # Schema
@@ -337,6 +349,9 @@ def build_model(rows, include_pass=False, include_muted=True):
 
     return {
         "meta": {
+            # Browser storage is keyed on this, so two reports covering different accounts
+            # keep separate triage, while re-scanning the same accounts resumes the old one.
+            "reportKey": report_key(accounts),
             "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "scanTime": sorted(scan_times)[-1] if scan_times else "unknown",
             "prowlerVersion": ", ".join(sorted(prowler_versions)) or "unknown",
@@ -353,6 +368,37 @@ def build_model(rows, include_pass=False, include_muted=True):
         "services": services,
         "findings": ordered,
     }
+
+
+def report_key(accounts):
+    """
+    Stable identifier for "this set of accounts", used as the browser-storage key.
+
+    Deliberately derived from account IDs only, not from the scan time or row count, so
+    next month's scan of the same estate resumes the same triage rather than starting over.
+    """
+    joined = ",".join(sorted(accounts)) or "unknown"
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def load_state_file(path):
+    """
+    Read a previously exported triage state file. Returns ({}, None) when absent.
+
+    A corrupt or hand-edited state file must never stop the report being generated, so
+    problems are reported and then ignored.
+    """
+    if not path or not path.is_file():
+        return {}, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        return {}, f"could not read {path.name}: {exc}"
+
+    findings = data.get("findings") if isinstance(data, dict) else None
+    if not isinstance(findings, dict):
+        return {}, f"{path.name} has no 'findings' object; ignoring it"
+    return findings, None
 
 
 def build_service_index(findings):
@@ -443,12 +489,25 @@ def run_doctor(paths):
 # Rendering
 # --------------------------------------------------------------------------------------
 
-def render_html(model, title):
-    payload = json.dumps(model, separators=(",", ":"), ensure_ascii=False)
-    # The payload sits inside a <script> block, so no raw '<' may survive. Escaping it as
-    # \u003c is valid JSON and cannot terminate the tag early.
-    payload = payload.replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    return HTML_TEMPLATE.replace("__TITLE__", escape_text(title)).replace("__DATA__", payload)
+def render_html(model, title, state=None):
+    return (HTML_TEMPLATE
+            .replace("__TITLE__", escape_text(title))
+            .replace("__DATA__", embed_json(model))
+            .replace("__STATE__", embed_json({"findings": state or {}})))
+
+
+def embed_json(obj):
+    """
+    Serialise for embedding inside a <script> block.
+
+    No raw '<' may survive, or scan output containing '</script>' would terminate the tag
+    early and inject markup into the report. Escaping it as \\u003c is valid JSON and
+    decodes back to the same string.
+    """
+    payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    return (payload.replace("<", "\\u003c")
+                   .replace("", "\\u2028")
+                   .replace("", "\\u2029"))
 
 
 def escape_text(text):
@@ -474,6 +533,9 @@ def main(argv=None):
                         help="drop muted findings entirely")
     parser.add_argument("--title", default="Prowler Findings",
                         help="report title shown in the header")
+    parser.add_argument("--state", default=None,
+                        help=f"triage state file to pre-load (default: {DEFAULT_STATE_NAME} "
+                             "beside the output HTML, if present)")
     parser.add_argument("--doctor", action="store_true",
                         help="print schema diagnostics only; writes no report")
     parser.add_argument("--version", action="version", version=f"prowler-view {__version__}")
@@ -505,7 +567,13 @@ def main(argv=None):
         return 1
 
     output = Path(args.output)
-    output.write_text(render_html(model, args.title), encoding="utf-8")
+
+    state_path = Path(args.state) if args.state else output.parent / DEFAULT_STATE_NAME
+    state, state_problem = load_state_file(state_path)
+    if state_problem:
+        print(f"warning: {state_problem}", file=sys.stderr)
+
+    output.write_text(render_html(model, args.title, state), encoding="utf-8")
 
     meta = model["meta"]
     sev = meta["severityCounts"]
@@ -517,6 +585,17 @@ def main(argv=None):
         print(f"Filtered out {meta['droppedPass']} PASS rows (use --include-pass to keep them).")
     print(f"Grouped into {meta['findingCount']} findings across {len(model['services'])} services.")
     print("  " + "  ".join(f"{s}: {sev[s]}" for s in SEVERITY_ORDER if sev[s]))
+
+    if state:
+        present = {f["id"] for f in model["findings"]}
+        matched = sum(1 for key in state if key in present)
+        orphaned = len(state) - matched
+        print(f"Restored triage for {matched} finding(s) from {state_path.name}.")
+        if orphaned:
+            # Keep, don't drop: a check absent from this scan may well come back in the next
+            # one, and silently discarding someone's triage notes would be unforgivable.
+            print(f"  {orphaned} saved mark(s) refer to findings not in this scan; kept for later.")
+
     print(f"Wrote {output.resolve()} ({size_mb:.1f} MB)")
     return 0
 
@@ -585,6 +664,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px;
   }
   button.ghost:hover { border-color: var(--accent); }
+  button.ghost.active { border-color: var(--accent); color: var(--accent); }
   select {
     background: var(--bg); border: 1px solid var(--border); color: var(--text);
     padding: 6px 10px; border-radius: 6px; font-size: 12px; max-width: 220px;
@@ -715,6 +795,119 @@ HTML_TEMPLATE = r"""<!doctype html>
 
   .empty { color: var(--muted); padding: 60px 0; text-align: center; }
 
+  /* ---- triage: false-positive slider and complete tick box ---- */
+  /* Both controls MUST be <label> elements wrapping their checkbox. As a bare <span> the
+     visible track is not associated with the input, so clicking it does nothing at all -
+     only a scripted click on the input itself would register. */
+  .done-box {
+    display: flex; align-items: center; gap: 6px; flex: none; cursor: pointer;
+    padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px;
+    font-size: 11px; color: var(--muted); user-select: none;
+  }
+  .done-box:hover { border-color: var(--pass); color: var(--text); }
+  .done-box.on { border-color: var(--pass); color: var(--pass); }
+  .done-box input { width: 14px; height: 14px; margin: 0; cursor: pointer; accent-color: var(--pass); }
+
+  /* The slider sits on (blue) for a live finding and goes grey when switched to a false
+     positive, which also sorts the card to the bottom of the list. */
+  .switch { position: relative; width: 34px; height: 18px; flex: none; display: inline-block; cursor: pointer; }
+  .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .switch .track {
+    position: absolute; inset: 0; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 999px; cursor: pointer; transition: background 0.15s, border-color 0.15s;
+  }
+  .switch .track::before {
+    content: ""; position: absolute; width: 12px; height: 12px; left: 2px; top: 2px;
+    background: var(--muted); border-radius: 50%; transition: transform 0.15s, background 0.15s;
+  }
+  .switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+  .switch input:checked + .track::before { transform: translateX(16px); background: #fff; }
+  .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* Triaged cards stay readable but visibly settled. The dimming is applied to the content
+     rather than the whole card, so the triage controls themselves stay legible and you can
+     always see how to undo the mark. */
+  .finding.done .chev, .finding.done .badge,
+  .finding.done .finding-title, .finding.done .rescount { opacity: 0.45; }
+  .finding.fp .chev, .finding.fp .badge, .finding.fp .finding-title,
+  .finding.fp .rescount, .finding.fp .finding-body { opacity: 0.4; }
+  .finding.fp .badge { filter: grayscale(1); }
+  .finding.fp .finding-head { border-left-color: var(--border) !important; }
+  .finding.done .finding-title strong, .finding.fp .finding-title strong { text-decoration: line-through; }
+
+  .notes-flag { color: var(--medium); font-size: 11px; flex: none; }
+  .notes-box {
+    width: 100%; text-align: left; background: var(--bg); border: 1px dashed var(--border);
+    color: var(--muted); border-radius: 6px; padding: 10px 12px; cursor: pointer; font: inherit;
+    font-size: 12px; min-height: 42px;
+  }
+  .notes-box:hover { border-color: var(--accent); color: var(--text); }
+  .notes-box.filled { border-style: solid; color: var(--text); white-space: pre-wrap; }
+
+  /* ---- notes modal ---- */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex;
+    align-items: center; justify-content: center; z-index: 100; padding: 20px;
+  }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    width: min(680px, 100%); max-height: 80vh; display: flex; flex-direction: column;
+  }
+  .modal header { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .modal header strong { display: block; font-size: 14px; }
+  .modal header span { color: var(--muted); font-size: 11px; }
+  .modal textarea {
+    flex: 1; min-height: 220px; margin: 14px 16px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; resize: vertical;
+    font: inherit; font-size: 13px;
+  }
+  .modal textarea:focus { outline: none; border-color: var(--accent); }
+  .modal footer {
+    display: flex; justify-content: flex-end; gap: 8px; align-items: center;
+    padding: 12px 16px; border-top: 1px solid var(--border);
+  }
+  .modal footer .hint { margin-right: auto; color: var(--muted); font-size: 11px; }
+  button.primary {
+    background: var(--accent); border: 1px solid var(--accent); color: #fff;
+    padding: 7px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;
+  }
+
+  /* ---- resource table toolbar ---- */
+  .col-menu { position: relative; display: inline-block; }
+  .col-list {
+    position: absolute; top: calc(100% + 4px); left: 0; z-index: 30; min-width: 170px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px; box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+  }
+  .col-list label {
+    display: flex; align-items: center; gap: 7px; padding: 5px 7px; font-size: 12px;
+    cursor: pointer; border-radius: 4px;
+  }
+  .col-list label:hover { background: var(--panel-2); }
+  tr.dismissed { opacity: 0.4; }
+  tr.dismissed td { text-decoration: line-through; }
+  td.dismiss-cell { width: 34px; text-align: center; }
+  td.dismiss-cell button {
+    background: none; border: 1px solid var(--border); color: var(--muted); cursor: pointer;
+    border-radius: 4px; width: 22px; height: 22px; line-height: 1; font-size: 13px; padding: 0;
+  }
+  td.dismiss-cell button:hover { border-color: var(--accent); color: var(--accent); }
+  tr.dismissed td.dismiss-cell button { color: var(--accent); border-color: var(--accent); }
+
+  .banner {
+    background: #5a3a00; color: #ffd591; border-bottom: 1px solid var(--border);
+    padding: 8px 20px; font-size: 12px; flex: none;
+  }
+  [data-theme="light"] .banner { background: #fff4e6; color: #8a4b00; }
+
+  /* Markdown rendered inside finding prose. */
+  .md code {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 3px;
+    padding: 1px 5px; font-size: 12px;
+  }
+  .md ul { margin: 4px 0 8px; padding-left: 20px; }
+  .md strong { font-weight: 650; color: var(--text); }
+
   @media print {
     :root { --bg:#fff; --panel:#fff; --panel-2:#f6f8fa; --border:#d0d7de; --text:#000; --muted:#555; }
     .sidebar, .topbar .spacer, .topbar input, .topbar button, .topbar select, .res-tools { display: none !important; }
@@ -727,6 +920,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     .finding { break-inside: avoid; }
     .table-wrap { max-height: none; overflow: visible; }
     th { position: static; }
+    .triage, .col-menu, .dismiss-cell, .modal-backdrop, .banner { display: none !important; }
+    .finding.done, .finding.fp { opacity: 1; }
+    .notes-box { border-style: solid; }
   }
 </style>
 </head>
@@ -739,9 +935,17 @@ HTML_TEMPLATE = r"""<!doctype html>
   <select id="account-filter"><option value="">All accounts</option></select>
   <select id="region-filter"><option value="">All regions</option></select>
   <input type="search" id="search" placeholder="Search findings and resources...">
+  <button class="ghost" id="hide-done" title="Hide findings ticked complete">Hide complete</button>
+  <button class="ghost" id="hide-fp" title="Hide findings switched to false positive">Hide false pos.</button>
+  <button class="ghost" id="export-state" title="Download your triage marks as JSON">Export triage</button>
+  <button class="ghost" id="import-state" title="Load a previously exported triage file">Import</button>
+  <input type="file" id="import-file" accept="application/json,.json" hidden>
   <button class="ghost" id="expand-all">Expand all</button>
   <button class="ghost" id="theme-toggle">Light</button>
 </div>
+
+<div class="banner" id="storage-banner" hidden></div>
+<div id="modal-host"></div>
 
 <div class="layout">
   <aside class="sidebar" id="sidebar"></aside>
@@ -753,13 +957,28 @@ HTML_TEMPLATE = r"""<!doctype html>
 </div>
 
 <script type="application/json" id="report-data">__DATA__</script>
+<script type="application/json" id="report-state">__STATE__</script>
 <script>
 (function () {
   "use strict";
 
   var DATA = JSON.parse(document.getElementById("report-data").textContent);
+  var EMBEDDED = JSON.parse(document.getElementById("report-state").textContent);
   var SEVERITIES = ["critical", "high", "medium", "low", "informational"];
   var RESOURCE_PAGE = 200;   // rows rendered before the "show all" link
+  var STORAGE_KEY = "prowler-view:" + DATA.meta.reportKey;
+
+  var ALL_COLUMNS = [
+    {key: "uid",     label: "Resource"},
+    {key: "name",    label: "Name"},
+    {key: "region",  label: "Region"},
+    {key: "account", label: "Account"},
+    {key: "status",  label: "Status"},
+    {key: "reason",  label: "Reason"},
+    {key: "muted",   label: "Muted"},
+    {key: "tags",    label: "Tags"}
+  ];
+  var DEFAULT_COLUMNS = ["uid", "name", "region", "account", "status", "reason"];
 
   var state = {
     service: null,                      // null = all services
@@ -768,7 +987,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     region: "",
     query: "",
     open: new Set(),
-    shownAll: new Set()
+    shownAll: new Set(),
+    hideDone: false,
+    hideFp: false,
+    columns: DEFAULT_COLUMNS.slice(),
+    colMenuFor: null
   };
 
   function esc(s) {
@@ -778,6 +1001,160 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   function plural(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
+
+  var BY_ID = {};
+  DATA.findings.forEach(function (f) { BY_ID[f.id] = f; });
+  function byId(id) { return BY_ID[id]; }
+
+  // Finding ids are "<provider>::<check_id>" because that is what the saved triage file is
+  // keyed on. The "::" is not legal in a CSS selector, so DOM ids get a sanitised form and
+  // the two are kept apart deliberately.
+  function domId(id) { return "f-" + String(id).replace(/[^A-Za-z0-9_-]+/g, "_"); }
+
+  // ---- markdown ---------------------------------------------------------------------
+  // Prowler ships markdown in DESCRIPTION / RISK / REMEDIATION text. Escape FIRST, then
+  // apply formatting to the already-escaped string: doing it the other way round would let
+  // markup inside scan output become live HTML in the report.
+
+  function md(text) {
+    if (!text) return "";
+    var s = esc(text);
+    s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+    s = s.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    s = s.replace(/(^|[\s(])_([^_\n]+)_(?=[\s.,;:)]|$)/g, "$1<em>$2</em>");
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+    // Links: only http(s), so a crafted javascript: target cannot be smuggled through.
+    s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g,
+                  '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    s = s.replace(/(^|[\s])(https?:\/\/[^\s<]+)/g,
+                  '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+
+    // Turn runs of "- item" lines into a real list; leave other newlines as breaks.
+    var lines = s.split(/\r?\n/), out = [], buffer = [];
+    function flush() {
+      if (buffer.length) { out.push("<ul><li>" + buffer.join("</li><li>") + "</li></ul>"); buffer = []; }
+    }
+    lines.forEach(function (line) {
+      var m = line.match(/^\s*[-*]\s+(.*)$/);
+      if (m) { buffer.push(m[1]); } else { flush(); out.push(line); }
+    });
+    flush();
+    return out.join("\n").replace(/\n{2,}/g, "<br><br>").replace(/\n/g, "<br>");
+  }
+
+  // ---- triage state ------------------------------------------------------------------
+  // Shape: { "<provider>::<check_id>": { complete, falsePositive, notes,
+  //                                      resources: {"<resource uid>": true}, updated } }
+  // Keyed on check id rather than anything scan-specific, so a regenerated report from
+  // next month's scan picks the same marks back up.
+
+  var triage = {};
+  var storageOK = true;
+
+  function readStorage() {
+    try {
+      var raw = window.localStorage.getItem(STORAGE_KEY);
+      return raw ? (JSON.parse(raw).findings || {}) : {};
+    } catch (e) {
+      storageOK = false;   // private window, blocked site data, or a file:// restriction
+      return {};
+    }
+  }
+
+  function writeStorage() {
+    if (!storageOK) return;
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({version: 1, findings: triage}));
+    } catch (e) {
+      storageOK = false;
+      showStorageBanner();
+    }
+  }
+
+  function loadTriage() {
+    var stored = readStorage();
+    var embedded = EMBEDDED.findings || {};
+    var keys = {};
+    Object.keys(embedded).forEach(function (k) { keys[k] = true; });
+    Object.keys(stored).forEach(function (k) { keys[k] = true; });
+
+    // Where a finding exists in both, the newer edit wins. Entries that refer to checks
+    // absent from this scan are kept verbatim so exporting never drops someone's work.
+    Object.keys(keys).forEach(function (k) {
+      var a = embedded[k], b = stored[k];
+      if (a && b) triage[k] = (b.updated || "") >= (a.updated || "") ? b : a;
+      else triage[k] = a || b;
+    });
+    if (!storageOK) showStorageBanner();
+  }
+
+  function showStorageBanner() {
+    var el = document.getElementById("storage-banner");
+    el.textContent = "This browser is not allowing local storage, so triage marks will be " +
+      "lost when you close the tab. Use “Export triage” before you finish.";
+    el.hidden = false;
+  }
+
+  function entry(id) {
+    if (!triage[id]) triage[id] = {complete: false, falsePositive: false, notes: "", resources: {}};
+    if (!triage[id].resources) triage[id].resources = {};
+    return triage[id];
+  }
+
+  function mark(id, changes) {
+    var e = entry(id);
+    Object.keys(changes).forEach(function (k) { e[k] = changes[k]; });
+    e.updated = new Date().toISOString();
+    writeStorage();
+  }
+
+  function isComplete(f) { return !!(triage[f.id] && triage[f.id].complete); }
+  function isFalsePositive(f) { return !!(triage[f.id] && triage[f.id].falsePositive); }
+  function noteFor(f) { return (triage[f.id] && triage[f.id].notes) || ""; }
+  function isDismissed(f, uid) {
+    return !!(triage[f.id] && triage[f.id].resources && triage[f.id].resources[uid]);
+  }
+
+  function toggleResource(id, uid) {
+    var e = entry(id);
+    if (e.resources[uid]) delete e.resources[uid]; else e.resources[uid] = true;
+    e.updated = new Date().toISOString();
+    writeStorage();
+  }
+
+  function download(filename, text, mime) {
+    var blob = new Blob([text], {type: mime || "text/plain;charset=utf-8"});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function copyText(text, button) {
+    function done(ok) {
+      var original = button.textContent;
+      button.textContent = ok ? "Copied" : "Copy failed";
+      setTimeout(function () { button.textContent = original; }, 1200);
+    }
+    // navigator.clipboard is refused in some file:// contexts, so fall back to the old way.
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(legacyCopy(text)); });
+    } else {
+      done(legacyCopy(text));
+    }
+  }
+
+  function legacyCopy(text) {
+    var ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+    document.body.removeChild(ta);
+    return ok;
+  }
 
   // ---- filtering -------------------------------------------------------------------
 
@@ -809,11 +1186,17 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (state.service && f.service !== state.service) continue;
       if (!state.severities.has(f.severity)) continue;
       if (!matchesQuery(f, q)) continue;
+      if (state.hideDone && isComplete(f)) continue;
+      if (state.hideFp && isFalsePositive(f)) continue;
       // An account/region filter must hide findings with nothing left to show.
       if ((state.account || state.region) && visibleResources(f).length === 0) continue;
       out.push(f);
     }
-    return out;
+    // False positives sink to the bottom. DATA.findings already arrives in severity order,
+    // so partitioning preserves that ordering within each group.
+    var live = [], dismissed = [];
+    out.forEach(function (f) { (isFalsePositive(f) ? dismissed : live).push(f); });
+    return live.concat(dismissed);
   }
 
   // ---- rendering -------------------------------------------------------------------
@@ -876,35 +1259,109 @@ HTML_TEMPLATE = r"""<!doctype html>
     document.getElementById("sidebar").innerHTML = html;
   }
 
+  function activeColumns() {
+    return ALL_COLUMNS.filter(function (c) { return state.columns.indexOf(c.key) !== -1; });
+  }
+
+  function cellValue(r, key) {
+    if (key === "muted") return r.muted ? "yes" : "no";
+    return r[key] == null ? "" : String(r[key]);
+  }
+
+  /** Resources for export: account/region filtered and sorted, but never cut to the page
+   *  size. The 200-row display cap is a rendering concession; silently truncating a
+   *  download would quietly corrupt whatever the file is used for. */
+  function exportableResources(f) {
+    var rows = visibleResources(f).slice();
+    rows.sort(function (a, b) {
+      var da = isDismissed(f, a.uid) ? 1 : 0, db = isDismissed(f, b.uid) ? 1 : 0;
+      return da - db;
+    });
+    return rows;
+  }
+
   function resourceTable(f) {
-    var rows = visibleResources(f);
+    var rows = exportableResources(f);
+    var cols = activeColumns();
     var showAll = state.shownAll.has(f.id);
     var slice = showAll ? rows : rows.slice(0, RESOURCE_PAGE);
+    var dismissedCount = rows.filter(function (r) { return isDismissed(f, r.uid); }).length;
 
     var body = slice.map(function (r) {
-      return "<tr>" +
-        '<td class="uid">' + esc(r.uid || r.name || "-") + "</td>" +
-        "<td>" + esc(r.name || "-") + "</td>" +
-        "<td>" + esc(r.region) + "</td>" +
-        "<td>" + esc(r.account) + "</td>" +
-        '<td class="st ' + esc(r.status) + '">' + esc(r.status) + "</td>" +
-        "<td>" + esc(r.reason || "") + "</td>" +
-      "</tr>";
+      var off = isDismissed(f, r.uid);
+      var cells = cols.map(function (c) {
+        if (c.key === "uid") return '<td class="uid">' + esc(r.uid || r.name || "-") + "</td>";
+        if (c.key === "status") return '<td class="st ' + esc(r.status) + '">' + esc(r.status) + "</td>";
+        return "<td>" + esc(cellValue(r, c.key) || "-") + "</td>";
+      }).join("");
+      return '<tr' + (off ? ' class="dismissed"' : "") + ">" + cells +
+        '<td class="dismiss-cell"><button data-dismiss="' + esc(f.id) + '" data-uid="' + esc(r.uid) +
+        '" title="' + (off ? "Restore this resource" : "Dismiss this resource as a false positive") +
+        '">' + (off ? "&#8635;" : "&#10005;") + "</button></td></tr>";
     }).join("");
 
     var more = "";
     if (rows.length > slice.length) {
       more = '<div class="more-row">Showing ' + slice.length + " of " + rows.length +
-             ' resources. <button data-showall="' + f.id + '">Show all</button></div>';
+             ' resources (exports include all ' + rows.length + '). ' +
+             '<button data-showall="' + f.id + '">Show all</button></div>';
     }
 
-    return '<div class="res-tools">' +
-             '<input type="text" placeholder="Filter these resources..." data-resfilter="' + f.id + '">' +
-             '<span class="chip">' + plural(rows.length, "resource") + '</span>' +
-           "</div>" +
-           '<div class="table-wrap"><table data-restable="' + f.id + '"><thead><tr>' +
-             "<th>Resource</th><th>Name</th><th>Region</th><th>Account</th><th>Status</th><th>Reason</th>" +
+    var menu = "";
+    if (state.colMenuFor === f.id) {
+      menu = '<div class="col-list">' + ALL_COLUMNS.map(function (c) {
+        var on = state.columns.indexOf(c.key) !== -1;
+        return '<label><input type="checkbox" data-col="' + c.key + '"' + (on ? " checked" : "") +
+               "> " + c.label + "</label>";
+      }).join("") + "</div>";
+    }
+
+    var tools =
+      '<div class="res-tools">' +
+        '<input type="text" placeholder="Filter these resources..." data-resfilter="' + esc(f.id) + '">' +
+        '<span class="col-menu"><button class="ghost" data-colmenu="' + esc(f.id) + '">Columns &#9662;</button>' +
+          menu + "</span>" +
+        '<button class="ghost" data-copy="' + esc(f.id) + '" title="Copy the table as TSV">Copy</button>' +
+        '<button class="ghost" data-csv="' + esc(f.id) + '" title="Download the table as CSV">Download CSV</button>' +
+        '<button class="ghost" data-list="' + esc(f.id) + '" title="Download resource identifiers, one per line">Download list</button>' +
+        '<span class="chip">' + plural(rows.length, "resource") +
+          (dismissedCount ? " · " + dismissedCount + " dismissed" : "") + "</span>" +
+      "</div>";
+
+    return tools +
+           '<div class="table-wrap"><table data-restable="' + esc(f.id) + '"><thead><tr>' +
+             cols.map(function (c) { return "<th>" + c.label + "</th>"; }).join("") +
+             "<th></th>" +
            "</tr></thead><tbody>" + body + "</tbody></table>" + more + "</div>";
+  }
+
+  function tableRows(f) {
+    var cols = activeColumns();
+    var out = [cols.map(function (c) { return c.label; })];
+    exportableResources(f).forEach(function (r) {
+      out.push(cols.map(function (c) { return cellValue(r, c.key); }));
+    });
+    return out;
+  }
+
+  function toCSV(matrix) {
+    return matrix.map(function (row) {
+      return row.map(function (cell) {
+        var v = String(cell == null ? "" : cell);
+        return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+      }).join(",");
+    }).join("\r\n");
+  }
+
+  function toTSV(matrix) {
+    // Tabs and newlines inside a cell would break the paste, so flatten them to spaces.
+    return matrix.map(function (row) {
+      return row.map(function (c) { return String(c == null ? "" : c).replace(/[\t\r\n]+/g, " "); }).join("\t");
+    }).join("\n");
+  }
+
+  function safeName(f, ext) {
+    return (f.checkId || "resources").replace(/[^a-z0-9_.-]+/gi, "-") + "." + ext;
   }
 
   function codeBlock(label, code) {
@@ -913,13 +1370,18 @@ HTML_TEMPLATE = r"""<!doctype html>
   }
 
   function findingBody(f) {
-    var html = "";
-    if (f.description) html += '<div class="section"><h3>Description</h3><p>' + esc(f.description) + "</p></div>";
-    if (f.risk) html += '<div class="section"><h3>Risk</h3><p>' + esc(f.risk) + "</p></div>";
+    var note = noteFor(f);
+    var html = '<div class="section"><h3>Notes</h3>' +
+      '<button class="notes-box' + (note ? " filled" : "") + '" data-notes="' + esc(f.id) + '">' +
+        (note ? esc(note) : "Click to add your notes for this finding…") +
+      "</button></div>";
+
+    if (f.description) html += '<div class="section md"><h3>Description</h3><p>' + md(f.description) + "</p></div>";
+    if (f.risk) html += '<div class="section md"><h3>Risk</h3><p>' + md(f.risk) + "</p></div>";
 
     if (f.remediationText || f.remediationUrl || f.urls.length) {
-      html += '<div class="section"><h3>Remediation</h3>';
-      if (f.remediationText) html += "<p>" + esc(f.remediationText) + "</p>";
+      html += '<div class="section md"><h3>Remediation</h3>';
+      if (f.remediationText) html += "<p>" + md(f.remediationText) + "</p>";
       var links = f.urls.slice();
       if (f.remediationUrl && links.indexOf(f.remediationUrl) === -1) links.unshift(f.remediationUrl);
       if (links.length) {
@@ -972,18 +1434,41 @@ HTML_TEMPLATE = r"""<!doctype html>
     host.innerHTML = list.map(function (f) {
       var open = state.open.has(f.id);
       var n = visibleResources(f).length;
+      var done = isComplete(f), fp = isFalsePositive(f);
       var tags = "";
       if (f.muted) tags += ' <span class="tag muted-tag">muted</span>';
       if (f.status === "MANUAL") tags += ' <span class="tag">manual</span>';
       if (f.status === "PASS") tags += ' <span class="tag">pass</span>';
 
-      return '<div class="finding ' + f.severity + (open ? " open" : "") + '" id="f-' + esc(f.id) + '">' +
-        '<div class="finding-head" data-toggle="' + esc(f.id) + '">' +
-          '<span class="chev">&#9656;</span>' +
-          '<span class="badge ' + f.severity + '">' + f.severity + "</span>" +
-          '<span class="finding-title"><strong>' + esc(f.title) + tags + "</strong>" +
+      var cls = "finding " + f.severity + (open ? " open" : "") + (done ? " done" : "") + (fp ? " fp" : "");
+
+      // Both controls sit outside the click-to-expand area, so operating them never also
+      // opens or closes the card. They are <label>s so that clicking the visible control
+      // actually reaches the checkbox inside it.
+      var slider =
+        '<label class="switch" title="Switch off to mark this finding as a false positive">' +
+          '<input type="checkbox" data-fp="' + esc(f.id) + '"' + (fp ? "" : " checked") + ">" +
+          '<span class="track"></span>' +
+        "</label>";
+      var doneBox =
+        '<label class="done-box' + (done ? " on" : "") + '" title="Mark this finding as triaged">' +
+          '<input type="checkbox" data-done="' + esc(f.id) + '"' + (done ? " checked" : "") + ">" +
+          "<span>done</span>" +
+        "</label>";
+
+      return '<div class="' + cls + '" id="' + domId(f.id) + '">' +
+        '<div class="finding-head">' +
+          '<span class="chev" data-toggle="' + esc(f.id) + '">&#9656;</span>' +
+          '<span class="badge ' + f.severity + '" data-toggle="' + esc(f.id) + '">' + f.severity + "</span>" +
+          '<span class="finding-title" data-toggle="' + esc(f.id) + '"><strong>' + esc(f.title) + tags +
+            (noteFor(f) ? ' <span class="notes-flag" title="Has notes">&#9998;</span>' : "") + "</strong>" +
             '<span class="checkid">' + esc(f.service) + " &middot; " + esc(f.checkId) + "</span></span>" +
-          '<span class="rescount"><b>' + n + "</b> " + (n === 1 ? "resource" : "resources") + "</span>" +
+          // The resource count goes first because its width varies with the digit count;
+          // keeping the two fixed-width controls last lines them up down the whole list.
+          '<span class="rescount" data-toggle="' + esc(f.id) + '"><b>' + n + "</b> " +
+            (n === 1 ? "resource" : "resources") + "</span>" +
+          slider +
+          doneBox +
         "</div>" +
         '<div class="finding-body">' + (open ? findingBody(f) : "") + "</div>" +
       "</div>";
@@ -1022,13 +1507,49 @@ HTML_TEMPLATE = r"""<!doctype html>
       renderFindings();
       return;
     }
+
+    var notes = e.target.closest("[data-notes]");
+    if (notes) { openNotes(notes.getAttribute("data-notes")); return; }
+
+    var dismiss = e.target.closest("[data-dismiss]");
+    if (dismiss) {
+      toggleResource(dismiss.getAttribute("data-dismiss"), dismiss.getAttribute("data-uid"));
+      renderFindings();
+      return;
+    }
+
+    var colmenu = e.target.closest("[data-colmenu]");
+    if (colmenu) {
+      var fid = colmenu.getAttribute("data-colmenu");
+      state.colMenuFor = state.colMenuFor === fid ? null : fid;
+      renderFindings();
+      return;
+    }
+    var copyBtn = e.target.closest("[data-copy]");
+    if (copyBtn) { copyText(toTSV(tableRows(byId(copyBtn.getAttribute("data-copy")))), copyBtn); return; }
+
+    var csvBtn = e.target.closest("[data-csv]");
+    if (csvBtn) {
+      var fc = byId(csvBtn.getAttribute("data-csv"));
+      download(safeName(fc, "csv"), toCSV(tableRows(fc)), "text/csv;charset=utf-8");
+      return;
+    }
+
+    var listBtn = e.target.closest("[data-list]");
+    if (listBtn) {
+      var fl = byId(listBtn.getAttribute("data-list"));
+      var ids = exportableResources(fl).map(function (r) { return r.uid || r.name; });
+      download(safeName(fl, "txt"), ids.join("\r\n") + "\r\n");
+      return;
+    }
+
     var head = e.target.closest("[data-toggle]");
     if (!head) return;
     var id = head.getAttribute("data-toggle");
     if (state.open.has(id)) state.open.delete(id); else state.open.add(id);
     renderFindings();
     // Keep the card you just opened in view; .main is the scroller, not the window.
-    var el = document.getElementById("f-" + id);
+    var el = document.getElementById(domId(id));
     if (el && state.open.has(id)) {
       var main = document.querySelector(".main");
       var offset = el.getBoundingClientRect().top - main.getBoundingClientRect().top;
@@ -1047,6 +1568,76 @@ HTML_TEMPLATE = r"""<!doctype html>
       row.style.display = row.textContent.toLowerCase().indexOf(q) !== -1 ? "" : "none";
     });
   });
+
+  // An open column menu closes on any click outside it. This has to live on the document,
+  // not on #findings: a click on the sidebar or the top bar never reaches that listener.
+  document.addEventListener("click", function (e) {
+    if (!state.colMenuFor) return;
+    if (e.target.closest(".col-menu")) return;
+    state.colMenuFor = null;
+    renderFindings();
+  });
+
+  // Triage controls and the column chooser.
+  document.getElementById("findings").addEventListener("change", function (e) {
+    var done = e.target.closest("[data-done]");
+    if (done) { mark(done.getAttribute("data-done"), {complete: done.checked}); renderFindings(); return; }
+
+    // The slider reads "this finding is live", so unchecking it is what marks a false positive.
+    var fp = e.target.closest("[data-fp]");
+    if (fp) { mark(fp.getAttribute("data-fp"), {falsePositive: !fp.checked}); render(); return; }
+
+    var col = e.target.closest("[data-col]");
+    if (col) {
+      var key = col.getAttribute("data-col");
+      var at = state.columns.indexOf(key);
+      if (col.checked && at === -1) {
+        // Keep the user's columns in the canonical order rather than click order.
+        state.columns = ALL_COLUMNS.filter(function (c) {
+          return c.key === key || state.columns.indexOf(c.key) !== -1;
+        }).map(function (c) { return c.key; });
+      } else if (!col.checked && at !== -1 && state.columns.length > 1) {
+        state.columns.splice(at, 1);
+      }
+      renderFindings();
+    }
+  });
+
+  // ---- notes modal -------------------------------------------------------------------
+
+  function openNotes(id) {
+    var f = byId(id);
+    if (!f) return;
+    var host = document.getElementById("modal-host");
+    host.innerHTML =
+      '<div class="modal-backdrop" id="notes-backdrop"><div class="modal">' +
+        "<header><strong>" + esc(f.title) + "</strong><span>" + esc(f.checkId) + "</span></header>" +
+        '<textarea id="notes-text" placeholder="Why is this a false positive? What did you check?"></textarea>' +
+        '<footer><span class="hint">Esc to cancel</span>' +
+          '<button class="ghost" id="notes-cancel">Cancel</button>' +
+          '<button class="primary" id="notes-save">Save</button>' +
+        "</footer>" +
+      "</div></div>";
+
+    var box = document.getElementById("notes-text");
+    box.value = noteFor(f);
+    box.focus();
+
+    function close() { host.innerHTML = ""; document.removeEventListener("keydown", onKey); }
+    function save() { mark(id, {notes: box.value.trim()}); close(); renderFindings(); }
+    function onKey(ev) {
+      if (ev.key === "Escape") close();
+      // Ctrl/Cmd+Enter saves, matching the usual convention for a multi-line field.
+      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) save();
+    }
+
+    document.getElementById("notes-save").addEventListener("click", save);
+    document.getElementById("notes-cancel").addEventListener("click", close);
+    document.getElementById("notes-backdrop").addEventListener("mousedown", function (ev) {
+      if (ev.target.id === "notes-backdrop") close();
+    });
+    document.addEventListener("keydown", onKey);
+  }
 
   // Sort a resource table by clicking its header.
   document.getElementById("findings").addEventListener("click", function (e) {
@@ -1094,6 +1685,57 @@ HTML_TEMPLATE = r"""<!doctype html>
     renderFindings();
   });
 
+  function toggleButton(id, key, onLabel, offLabel) {
+    document.getElementById(id).addEventListener("click", function (e) {
+      state[key] = !state[key];
+      e.target.textContent = state[key] ? onLabel : offLabel;
+      e.target.classList.toggle("active", state[key]);
+      render();
+    });
+  }
+  toggleButton("hide-done", "hideDone", "Show complete", "Hide complete");
+  toggleButton("hide-fp", "hideFp", "Show false pos.", "Hide false pos.");
+
+  document.getElementById("export-state").addEventListener("click", function () {
+    // Exports the whole triage object, including marks for checks absent from this scan,
+    // so re-importing into a later report restores them if those checks come back.
+    var payload = {
+      version: 1,
+      reportKey: DATA.meta.reportKey,
+      exported: new Date().toISOString(),
+      findings: triage
+    };
+    download("prowler-view-state.json", JSON.stringify(payload, null, 2), "application/json");
+  });
+
+  document.getElementById("import-state").addEventListener("click", function () {
+    document.getElementById("import-file").click();
+  });
+
+  document.getElementById("import-file").addEventListener("change", function (e) {
+    var file = e.target.files && e.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      var incoming;
+      try { incoming = JSON.parse(reader.result).findings; } catch (err) { incoming = null; }
+      if (!incoming || typeof incoming !== "object") {
+        alert("That file does not look like a prowler-view triage export.");
+        return;
+      }
+      var added = 0;
+      Object.keys(incoming).forEach(function (k) {
+        var mine = triage[k], theirs = incoming[k];
+        if (!mine || (theirs.updated || "") > (mine.updated || "")) { triage[k] = theirs; added++; }
+      });
+      writeStorage();
+      render();
+      alert("Imported " + added + " newer mark(s) from " + file.name + ".");
+    };
+    reader.readAsText(file);
+    e.target.value = "";   // let the same file be picked again later
+  });
+
   document.getElementById("theme-toggle").addEventListener("click", function (e) {
     var light = document.documentElement.getAttribute("data-theme") === "light";
     document.documentElement.setAttribute("data-theme", light ? "dark" : "light");
@@ -1105,6 +1747,7 @@ HTML_TEMPLATE = r"""<!doctype html>
     state.service = decodeURIComponent(location.hash.slice("#service=".length)) || null;
   }
 
+  loadTriage();
   renderMeta();
   render();
 })();
