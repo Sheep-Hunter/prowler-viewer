@@ -500,14 +500,23 @@ def embed_json(obj):
     """
     Serialise for embedding inside a <script> block.
 
-    No raw '<' may survive, or scan output containing '</script>' would terminate the tag
-    early and inject markup into the report. Escaping it as \\u003c is valid JSON and
-    decodes back to the same string.
+    ensure_ascii (json's default) escapes every non-ASCII character as \\uXXXX. That also
+    covers U+2028 and U+2029, the Unicode line separators that are legal inside JSON but
+    have historically broken JavaScript parsers - and it does so without this file needing
+    to contain those characters, which do not survive being written to source reliably.
+
+    Only '<' is left to handle: scan output containing '</script>' would otherwise
+    terminate the tag early and inject markup into the report. Escaping it as \\u003c is
+    valid JSON and decodes back to the same string.
     """
-    payload = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-    return (payload.replace("<", "\\u003c")
-                   .replace("", "\\u2028")
-                   .replace("", "\\u2029"))
+    payload = json.dumps(obj, separators=(",", ":")).replace("<", "\\u003c")
+
+    # Cheap insurance. A broken escaping step produces a report that looks fine to the
+    # script, writes without error, and then renders as a blank page in the browser. Failing
+    # loudly here costs one extra parse and makes that impossible to ship unnoticed.
+    if json.loads(payload) != obj:
+        raise RuntimeError("embedded JSON did not round-trip; refusing to write a broken report")
+    return payload
 
 
 def escape_text(text):
